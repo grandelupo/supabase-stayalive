@@ -6,7 +6,8 @@ require_once __DIR__ . '/vendor/autoload.php';
 use Dotenv\Dotenv;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Promise;
+use GuzzleHttp\Pool;
+use GuzzleHttp\Psr7\Request;
 
 class SupabaseStayAlive
 {
@@ -141,17 +142,16 @@ class SupabaseStayAlive
             exit(1);
         }
 
-        // Create promises for concurrent requests
-        $promises = [];
-        foreach ($this->databases as $config) {
-            $promises[] = $this->createPingPromise($config);
-        }
-
-        // Wait for all requests to complete
+        // Try concurrent requests with Pool, fallback to sequential if not available
         try {
-            Promise\settle($promises)->wait();
+            if (class_exists('GuzzleHttp\Pool')) {
+                $this->pingDatabasesConcurrent();
+            } else {
+                throw new Exception('Pool class not available');
+            }
         } catch (Exception $e) {
-            echo "⚠️  Some requests failed: " . $e->getMessage() . "\n";
+            echo "⚠️  Falling back to sequential requests: " . $e->getMessage() . "\n";
+            $this->pingDatabasesSequential();
         }
 
         // Summary
@@ -180,11 +180,75 @@ class SupabaseStayAlive
         echo "\n🎉 All databases pinged successfully!\n";
     }
 
-    private function createPingPromise($config)
+    private function pingDatabasesConcurrent()
     {
-        return Promise\coroutine(function() use ($config) {
-            return $this->pingDatabase($config);
-        });
+        $requests = [];
+        foreach ($this->databases as $index => $config) {
+            $name = $config['name'];
+            $url = $config['url'];
+            $anonKey = $config['anon_key'];
+
+            echo "🏓 Pinging {$name}...\n";
+
+            // Try the most reliable endpoint first
+            $endpoint = '/rest/v1/_realtime_schema_version?select=*&limit=1';
+            
+            $requests[$index] = new Request('GET', $url . $endpoint, [
+                'Authorization' => 'Bearer ' . $anonKey,
+                'apikey' => $anonKey,
+                'Content-Type' => 'application/json'
+            ]);
+        }
+
+        $pool = new Pool($this->httpClient, $requests, [
+            'concurrency' => 5,
+            'fulfilled' => function ($response, $index) {
+                $config = $this->databases[$index];
+                $this->handleSuccessfulResponse($config, $response);
+            },
+            'rejected' => function ($reason, $index) {
+                $config = $this->databases[$index];
+                $this->handleFailedResponse($config, $reason);
+            }
+        ]);
+
+        $promise = $pool->promise();
+        $promise->wait();
+    }
+
+    private function pingDatabasesSequential()
+    {
+        foreach ($this->databases as $config) {
+            $this->pingDatabase($config);
+        }
+    }
+
+    private function handleSuccessfulResponse($config, $response)
+    {
+        $name = $config['name'];
+        
+        $this->results[] = [
+            'database' => $name,
+            'status' => 'success',
+            'timestamp' => date('c')
+        ];
+
+        echo "✅ {$name} - Connection successful\n";
+    }
+
+    private function handleFailedResponse($config, $reason)
+    {
+        $name = $config['name'];
+        $error = $reason instanceof Exception ? $reason->getMessage() : (string) $reason;
+        
+        $this->results[] = [
+            'database' => $name,
+            'status' => 'error',
+            'error' => $error,
+            'timestamp' => date('c')
+        ];
+
+        echo "❌ {$name} - Connection failed: {$error}\n";
     }
 }
 
